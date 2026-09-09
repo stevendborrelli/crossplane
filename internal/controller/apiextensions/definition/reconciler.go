@@ -562,6 +562,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		composite.WithCompositeConnectionDetailsFetcher(fetcher),
 		composite.WithRequiredSchemasFetcher(xfn.NewOpenAPIRequiredSchemasFetcher(r.options.OpenAPIClient)),
 		composite.WithResourceTracker(tracker),
+		composite.WithComposedResourceOrdering(r.options.Features.Enabled(features.EnableAlphaComposedResourceOrdering)),
 	)
 
 	cb := circuit.NewTokenBucketBreaker(controllerName,
@@ -569,6 +570,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		circuit.WithBurst(r.options.CircuitBreakerBurst),
 		circuit.WithRefillRatePerSecond(r.options.CircuitBreakerRefillRate),
 		circuit.WithOpenDuration(r.options.CircuitBreakerCooldown),
+		circuit.WithHalfOpenInterval(r.options.CircuitBreakerHalfOpenInterval),
 	)
 
 	//nolint:staticcheck // TODO(adamwg) Stop using meta.ReferenceTo after the v2.2 release.
