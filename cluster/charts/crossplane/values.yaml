@@ -12,7 +12,7 @@ deploymentStrategy: RollingUpdate
 
 image:
   # -- Repository for the Crossplane pod image.
-  repository: xpkg.crossplane.io/crossplane/crossplane
+  repository: ghcr.io/stevendborrelli/crossplane
   # -- The Crossplane image tag. Defaults to the value of `appVersion` in `Chart.yaml`.
   tag: ""
   # -- The image pull policy used for Crossplane and RBAC Manager pods.
@@ -52,7 +52,12 @@ serviceAccount:
 # -- Enable [leader election](https://docs.crossplane.io/latest/guides/pods/#leader-election) for the Crossplane pod.
 leaderElection: true
 # -- Add custom arguments to the Crossplane pod.
-args: []
+args:
+- --enable-composed-resource-ordering
+# Ordering converges over one reconcile per dependency level, and at the
+# default burst the realtime compositions circuit breaker opens partway
+# through a deep graph.
+- --circuit-breaker-burst=100000
 
 provider:
   # -- A list of Provider packages to install.
