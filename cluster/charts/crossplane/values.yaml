@@ -54,10 +54,6 @@ leaderElection: true
 # -- Add custom arguments to the Crossplane pod.
 args:
 - --enable-composed-resource-ordering
-# Ordering converges over one reconcile per dependency level, and at the
-# default burst the realtime compositions circuit breaker opens partway
-# through a deep graph.
-- --circuit-breaker-burst=100000
 
 provider:
   # -- A list of Provider packages to install.
