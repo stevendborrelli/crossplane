@@ -33,11 +33,16 @@ dependencies a function returns.
 * Docker, `kind`, `kubectl` and `helm`.
 * [crossplane-graph][graph], which prints the graph off an XR. It needs Go
   1.26 to install.
-* A checkout of the prototype, for the test fixtures:
+* A checkout of the prototype, for the test fixtures. Every command below runs
+  from its root:
 
   ```shell
-  gh pr checkout 7842 --repo crossplane/crossplane
+  git clone -b composed-resource-ordering-prototype https://github.com/stevendborrelli/crossplane.git
+  cd crossplane
   ```
+
+  In an existing clone of crossplane/crossplane, `gh pr checkout 7842` does the
+  same.
 
 Everything below runs against a throwaway cluster and leaves nothing behind on
 your machine except a kind cluster.
@@ -56,7 +61,7 @@ ordering turned on, so nothing needs building:
 ```shell
 kind create cluster --name xp-ordering
 helm install crossplane oci://ghcr.io/stevendborrelli/charts/crossplane \
-  --version 2.5.0-ordering.2 \
+  --version 2.5.0-ordering.3 \
   -n crossplane-system --create-namespace --wait
 ```
 
@@ -66,10 +71,12 @@ Confirm the flag took:
 kubectl -n crossplane-system logs deploy/crossplane | grep "Alpha feature enabled"
 ```
 
-The chart also raises `--circuit-breaker-burst` to 100000. Ordering converges
-over one reconcile per dependency level, and at the default burst the realtime
-compositions circuit breaker opens partway through a deep graph, after which
-each wave waits for a periodic probe. See Limitations.
+The chart leaves the realtime compositions circuit breaker at its defaults.
+Releases up to `2.5.0-ordering.2` raised `--circuit-breaker-burst` to 100000,
+because at the default burst the breaker opened partway through a deep graph
+and each later wave waited for a periodic probe. From `2.5.0-ordering.3` the
+events that release a wave get past the breaker, so it doesn't need raising.
+See Limitations.
 
 ### Building Crossplane from the branch instead
 
@@ -84,7 +91,7 @@ helm install crossplane ./cluster/charts/crossplane \
   -n crossplane-system --create-namespace --wait \
   --set image.repository="${image%:*}" --set image.tag="${image#*:}" \
   --set image.pullPolicy=Never \
-  --set 'args={--enable-composed-resource-ordering,--circuit-breaker-burst=100000}'
+  --set 'args={--enable-composed-resource-ordering}'
 ```
 
 `./nix.sh run .#stream-image` does the same without installing Nix. The image
@@ -120,9 +127,11 @@ kubectl wait --for=condition=Healthy --timeout=3m \
 ```
 
 The runtime config sets `--poll=1s`, and it matters more than it looks.
-provider-nop flips a NopResource's conditions, and finishes its deletion, when
-it next *polls* the resource - not when the configured duration elapses. At the
-default 10s poll a `readyAfter` of 1s still costs up to 10s per wave.
+provider-nop flips a NopResource's conditions when it next *polls* the
+resource - not when the configured duration elapses. At the default 10s poll a
+`readyAfter` of 1s still costs up to 10s per wave. Deletion doesn't depend on
+the poll: since v0.6.0 provider-nop reconciles a deleting resource again as
+soon as its `deleteAfter` runs out.
 
 Then the XRD:
 
@@ -308,10 +317,22 @@ should check for `CAPABILITY_DEPENDENCIES` in the request before relying on
 them. An older Crossplane accepts the field without enforcing it.
 
 * **Python.** [function-sdk-python#241][sdk-python] adds
-  `response.add_dependency` and friends, and a `reference` module that records
-  a dependency when a field is filled in from another resource.
-* **Go.** Use the proto directly, as `test/e2e/functions/ordering/main.go`
-  does. There is no SDK helper yet.
+  `response.add_dependency` and friends, and a `dependency` module that records
+  a dependency when a field is filled in from another resource:
+
+  ```python
+  vpc = dependency.named("vpc", VPC)
+
+  with dependency.composing(req, rsp, "subnet") as c:
+      c.update(Subnet(spec={"forProvider": {"vpcId": c.external_name(vpc)}}))
+  # subnet -> vpc is recorded when the block exits
+  ```
+
+* **Go.** The `composed-resource-dependencies` branch of
+  [function-sdk-go][sdk-go] adds `response.AddDependency`,
+  `response.AddRequiredResourceDependency` and `response.WithCreateBeforeDestroy`.
+  It isn't proposed upstream yet. `test/e2e/functions/ordering/main.go` uses the
+  proto directly instead.
 * **Without changing your functions.** A single function at the end of the
   pipeline can declare the graph for everything before it.
   [function-ordering][fn-ordering] reads `function-sequencer`'s rules and
@@ -319,6 +340,7 @@ them. An older Crossplane accepts the field without enforcing it.
   `ghcr.io/stevendborrelli/function-ordering:v0.7.0-ordering.1`.
 
 [sdk-python]: https://github.com/crossplane/function-sdk-python/pull/241
+[sdk-go]: https://github.com/stevendborrelli/function-sdk-go/tree/composed-resource-dependencies
 [fn-ordering]: https://github.com/stevendborrelli/function-ordering
 
 To see the feature under a real platform, `notes-remote-e2e-plan.md` runs
@@ -341,7 +363,7 @@ git clone -b composed-resource-ordering https://github.com/stevendborrelli/cli.g
 
 /tmp/crossplane composition render $M/xr.yaml $M/create/composition-nested.yaml $M/setup/functions.yaml \
   --xrd $M/setup/definition.yaml \
-  --crossplane-image ghcr.io/stevendborrelli/crossplane:v2.5.0-ordering.2 \
+  --crossplane-image ghcr.io/stevendborrelli/crossplane:v2.5.0-ordering.3 \
   --enable-composed-resource-ordering
 ```
 
@@ -365,18 +387,21 @@ render, whatever it did on a cluster.
   intervene. `teardown/composition-blocked.yaml` shows it.
 * **`kubectl delete --cascade=foreground` bypasses ordering**, because
   Kubernetes starts deleting dependents as soon as the owner has a deletion
-  timestamp.
+  timestamp. So does a legacy claim with `compositeDeletePolicy: Foreground`.
+  Crossplane's own deletes don't: with ordering on, it deletes composed
+  resources, nested XRs included, with background propagation.
 * **Nothing stops an out-of-band delete.** The graph constrains Crossplane's
   own calls, not anyone else's. `kubectl delete` on a composed resource
   succeeds even while something depends on it, and Crossplane recreates it. A
   `Usage` would block the delete.
-* **Deep graphs need the circuit breaker's burst raised.** At the shipped
-  default of 100, an eight-deep chain opened the realtime compositions watch
-  circuit breaker after four waves, and each remaining wave took about a
-  minute. The released chart raises the burst; a Crossplane you install
-  another way needs `--circuit-breaker-burst` set, or the XR reports
-  `Responsive=False` with `WatchCircuitOpen` and later waves crawl.
-  `notes-circuit-breaker-scale-findings.md` has the measurements.
+* **The circuit breaker still opens on deep graphs.** It no longer slows them
+  down: an event from a composed resource that a pending creation depends on
+  gets past it, at most once every two seconds per source. At the breaker's
+  defaults a 100-deep chain of ConfigMaps converged in 15s, against timing out
+  at 1200s without the exemption, while the breaker opened and dropped the
+  events nothing was waiting for. The XR may still report `Responsive=False`
+  with `WatchCircuitOpen` while that happens. Only chains have been measured;
+  finding 7 in `notes-scale-findings.md` has the numbers.
 * **The test function is pinned to this branch's protocol.** It's compiled
   against `proto/fn/v1` here. If the `Dependency` messages change, republish it
   with `test/e2e/functions/ordering/build.sh` and bump the tag in
@@ -407,14 +432,16 @@ it.
 | `CreateBeforeDestroy` | A replacement and its predecessor exist at the same time, which a symmetric edge would never allow. |
 | `TeardownSurvivesRestart` | Teardown continues in order after Crossplane is restarted mid-way. The replacement process never ran the pipeline for that XR, so the order can only have come from `spec.crossplane.resourceRefs`. |
 | `TeardownIsOrderedOnLegacyXR` | A legacy v1 XR tears down a level at a time too, reading the graph from `spec.resourceRefs`. If teardown ever read only the modern path, it would find no graph and cascade, which looks exactly like finishing. |
+| `TeardownIsOrderedInNestedXR` | An XR composed by another XR tears down in its own order when the parent deletes it. Crossplane deletes composed resources with background propagation when ordering is on; a foreground delete would have the garbage collector delete all of the child's resources at once. |
 
 Required resources and graph contradictions have fixtures but no end-to-end
 test; both are covered by unit tests.
 
-The whole suite takes about seven minutes on an 8 vCPU machine, including
-building Crossplane. `CreatesInWaves` is most of it: the suite leaves the
-circuit breaker at its default burst, so it opens partway through the
-four-level graph and later waves wait for its periodic probe.
+The whole suite took about seven minutes on an 8 vCPU machine, including
+building Crossplane, before the circuit breaker exemption. `CreatesInWaves` was
+most of it: the suite leaves the breaker at its defaults, so it opened partway
+through the four-level graph and later waves waited for its periodic probe. The
+exemption should remove that wait; the suite hasn't been timed since.
 
 ## Rebuilding the function
 
