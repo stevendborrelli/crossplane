@@ -17,7 +17,7 @@
     }:
     let
       # Set by CI to override the auto-generated dev version.
-      buildVersion = "v2.5.0-ordering.5";
+      buildVersion = "v2.5.0-ordering.6";
 
       # Platforms we build Go binaries for.
       goPlatforms = [

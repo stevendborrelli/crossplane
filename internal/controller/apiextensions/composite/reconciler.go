@@ -1135,26 +1135,34 @@ func (r *Reconciler) teardown(ctx context.Context, xr *composite.Unstructured, s
 	refs := xr.GetComposedResourceReferences()
 
 	edges := EdgesFromRefs(refs)
-	log.Debug("Rebuilt the dependency graph from the XR's references", "references", len(refs), "edges", len(edges))
+
+	// A reference with no composition resource name can't be placed in the
+	// graph. Counting them is what lets an operator tell an XR whose pipeline
+	// declared no ordering from one whose references predate the fields that
+	// record it - both tear down in a single wave.
+	unnamed := 0
+	for _, ref := range refs {
+		if ref.ResourceName == "" {
+			unnamed++
+		}
+	}
+
+	log.Debug("Rebuilt the dependency graph from the XR's references", "references", len(refs), "edges", len(edges), "references-without-resource-name", unnamed)
 
 	observed, err := r.observer.ObserveComposedResources(ctx, xr)
 	if err != nil {
 		return false, errors.Wrap(err, errGetExistingCDs)
 	}
 
-	if len(edges) == 0 {
-		// This XR's pipeline declared no ordering, or its references predate
-		// the fields that record it. Either way there's no order to keep, so
-		// everything goes in one wave - but we still hold our finalizer until
-		// it's gone. Composed resources are deleted with background
-		// propagation, so if this XR is itself composed, its finalizer is the
-		// only thing keeping it around until what it composed is gone, which
-		// is what its parent's graph is waiting on.
-		//
-		// Only what we control counts. Kubernetes would never cascade to a
-		// resource we don't own, so waiting on one would hold the XR forever.
-		observed = controlledBy(xr, observed)
-	}
+	// Only what we control counts. The garbage collector refuses to delete a
+	// resource whose controller reference isn't ours, so a resource we don't
+	// control would be nominated by the graph every reconcile and never go -
+	// holding the XR's finalizer on something Kubernetes would never cascade
+	// to anyway. This applies whether or not the references record a graph:
+	// without one, waiting on it would hold the XR forever; with one, the
+	// same resource wedges teardown with an "already asked to delete" message
+	// that no one can act on.
+	observed = controlledBy(xr, observed)
 
 	log.Debug("Observed the composed resources that are left", "observed", len(observed))
 

@@ -58,6 +58,7 @@ const (
 	errDeleteCDs            = "cannot delete connection details"
 	errRemoveFinalizer      = "cannot remove finalizer from claim"
 	errAddFinalizer         = "cannot add finalizer to claim"
+	errListXRD              = "cannot list CompositeResourceDefinitions"
 	errUpgradeManagedFields = "cannot upgrade composite resource's managed fields from client-side to server-side apply"
 	errSync                 = "cannot bind and sync claim with composite resource"
 	errPropagateCDs         = "cannot propagate connection details from composite resource"
@@ -184,6 +185,11 @@ type Reconciler struct {
 
 	managedFields ManagedFieldsUpgrader
 
+	// How a claim with compositeDeletePolicy Foreground deletes its XR. The
+	// claim waits for the XR to be gone either way; this decides who deletes
+	// what the XR composed.
+	foregroundPropagation metav1.DeletionPropagation
+
 	// The below structs embed the set of interfaces used to implement the
 	// composite resource claim reconciler. We do this primarily for
 	// readability, so that the reconciler logic reads r.composite.Sync(),
@@ -227,6 +233,21 @@ type ReconcilerOption func(*Reconciler)
 func WithManagedFieldsUpgrader(u ManagedFieldsUpgrader) ReconcilerOption {
 	return func(r *Reconciler) {
 		r.managedFields = u
+	}
+}
+
+// WithForegroundDeletePropagation specifies the propagation policy a claim
+// whose compositeDeletePolicy is Foreground uses to delete its XR. It defaults
+// to foreground propagation, which makes the Kubernetes garbage collector
+// delete everything the XR composed at once.
+//
+// With composed resource ordering, use background propagation instead. The
+// XR's own finalizer then holds it until it has torn down what it composed in
+// order - which foreground propagation would bypass - and the claim still
+// waits for the XR to be gone before it goes.
+func WithForegroundDeletePropagation(p metav1.DeletionPropagation) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.foregroundPropagation = p
 	}
 }
 
@@ -279,11 +300,13 @@ func NewReconciler(c client.Client, of, with schema.GroupVersionKind, o ...Recon
 		gvkClaim:      of,
 		gvkXR:         with,
 		managedFields: &ssa.NopManagedFieldsUpgrader{},
-		composite:     defaultCRComposite(c),
-		claim:         defaultCRClaim(c),
-		log:           logging.NewNopLogger(),
-		record:        event.NewNopRecorder(),
-		conditions:    conditions.ObservedGenerationPropagationManager{},
+
+		foregroundPropagation: metav1.DeletePropagationForeground,
+		composite:             defaultCRComposite(c),
+		claim:                 defaultCRClaim(c),
+		log:                   logging.NewNopLogger(),
+		record:                event.NewNopRecorder(),
+		conditions:            conditions.ObservedGenerationPropagationManager{},
 	}
 
 	for _, ro := range o {
@@ -402,7 +425,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 
 			do := &client.DeleteOptions{}
 			if requiresForegroundDeletion {
-				client.PropagationPolicy(metav1.DeletePropagationForeground).ApplyToDelete(do)
+				client.PropagationPolicy(r.foregroundPropagation).ApplyToDelete(do)
 			}
 
 			if err := r.client.Delete(ctx, xr, do); resource.IgnoreNotFound(err) != nil {
@@ -457,11 +480,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	// We use an index to efficiently look up the XRD for this composite GVK.
 	hasEnforcedComposition := false
 	xrdList := &v1.CompositeResourceDefinitionList{}
-	if err := r.client.List(ctx, xrdList, client.MatchingFields{XRDByCompositeGVKIndex(): compositeGVKKeyFor(r.gvkXR)}); err == nil && len(xrdList.Items) > 0 {
-		// There should only be one XRD for a given composite GVK
-		if xrdList.Items[0].Spec.EnforcedCompositionRef != nil {
-			hasEnforcedComposition = true
-		}
+	if err := r.client.List(ctx, xrdList, client.MatchingFields{XRDByCompositeGVKIndex(): compositeGVKKeyFor(r.gvkXR)}); err != nil {
+		err = errors.Wrap(err, errListXRD)
+		record.Event(cm, event.Warning(reasonBind, err))
+		status.MarkConditions(xpv2.ReconcileError(err))
+		_ = r.client.Status().Update(ctx, cm)
+
+		return reconcile.Result{}, err
+	}
+	// There should only be one XRD for a given composite GVK
+	if len(xrdList.Items) > 0 && xrdList.Items[0].Spec.EnforcedCompositionRef != nil {
+		hasEnforcedComposition = true
 	}
 
 	// Create (if necessary), bind, and sync an XR with the claim.

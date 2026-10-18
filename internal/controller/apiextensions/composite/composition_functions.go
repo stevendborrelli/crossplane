@@ -20,8 +20,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -72,6 +74,8 @@ const (
 	errMarshalJSON              = "cannot marshal to JSON"
 
 	errFmtApplyCD                     = "cannot apply composed resource %q"
+	errFmtDependenciesIgnored         = "pipeline step %q returned %d dependency edge(s), but composed resource ordering is not enabled (--enable-composed-resource-ordering); they are ignored"
+	errFmtOrphanedDependency          = "composed resource %q left desired state while %s, which declared a dependency on it, is still desired; the pipeline no longer declares that dependency, so it does not hold back the deletion"
 	errFmtFetchCDConnectionDetails    = "cannot fetch connection details for composed resource %q (a %s named %s)"
 	errFmtUnmarshalPipelineStepInput  = "cannot unmarshal input for Composition pipeline step %q"
 	errFmtGetCredentialsFromSecret    = "cannot get Composition pipeline step %q credential %q from Secret"
@@ -385,6 +389,20 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 	deps := []*fnv1.Dependency{}
 	reqres := map[string]*fnv1.Resources{}
 
+	// Every edge any step declared this run, and the step that first declared
+	// it. A later step may drop an edge an earlier one declared; we keep it
+	// here so that, if the edge's resource is leaving, it can still order the
+	// exit - and so a validation failure can name the step to look at.
+	seen := []*fnv1.Dependency{}
+	declaredBy := map[dependencyIdentity]string{}
+
+	// The graph as of the last reconcile that succeeded. We capture it before
+	// this reconcile rewrites the XR's references.
+	var persisted []*fnv1.Dependency
+	if c.ordering {
+		persisted = AsDependencies(EdgesFromRefs(xr.GetComposedResourceReferences()))
+	}
+
 	// Requirement names an edge may refer to. A function declares what it
 	// requires in the same response that declares edges over it, so this has
 	// to include names the pipeline asked for but Crossplane hasn't fetched
@@ -563,14 +581,33 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 			// would let one such function erase every constraint declared
 			// before it.
 			if next := rsp.GetDependencies(); next != nil {
-				items := next.GetItems()
-				// A function that does have an opinion returns the whole set,
-				// and will naturally drop edges for resources it's removing -
-				// which is exactly when the garbage collector needs them. Keep
-				// any edge whose target is on its way out.
-				state := AsOrderingState(desiredStates(d), observed, reqres)
-				deps = retainDependencies(deps, items, state)
+				deps = next.GetItems()
+
+				for _, dep := range deps {
+					k := dependencyKey(dep)
+					if _, ok := declaredBy[k]; ok {
+						continue
+					}
+
+					declaredBy[k] = fn.Step
+					seen = append(seen, dep)
+				}
 			}
+		}
+
+		// Without ordering, Crossplane neither advertises the capability nor
+		// sends dependencies, so a function that returns some anyway didn't
+		// check. Say so rather than ignore them in silence: the function's
+		// author expects an order no one is enforcing. It's a warning, not a
+		// failure. A function whose ordering is required for correctness
+		// should require the capability itself, which is the only check that
+		// also works against a Crossplane that predates the field.
+		if n := len(rsp.GetDependencies().GetItems()); !c.ordering && n > 0 {
+			events = append(events, TargetedEvent{
+				Event:  event.Warning(reasonCompose, errors.Errorf(errFmtDependenciesIgnored, fn.Step, n)),
+				Detail: fmt.Sprintf("Pipeline step %q", fn.Step),
+				Target: CompositionTargetComposite,
+			})
 		}
 
 		// Pass the Function context returned by this Function to the next one.
@@ -726,7 +763,25 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 	// something that depends on it is still around.
 	decisions := ordering.Decisions{Blocked: map[string]ordering.Decision{}}
 
-	if c.ordering && len(deps) > 0 {
+	// Edges the pipeline no longer declares can still order a resource's
+	// exit: history orders the exit, but never blocks the present. See
+	// CarryForward.
+	var carried []*fnv1.Dependency
+
+	if c.ordering {
+		var orphaned map[string][]string
+
+		carried, orphaned = CarryForward(deps, slices.Concat(persisted, seen), desired, observed)
+
+		for _, t := range slices.Sorted(maps.Keys(orphaned)) {
+			events = append(events, TargetedEvent{
+				Event:  event.Warning(reasonCompose, errors.Errorf(errFmtOrphanedDependency, t, strings.Join(orphaned[t], ", "))),
+				Target: CompositionTargetComposite,
+			})
+		}
+	}
+
+	if c.ordering && len(deps)+len(carried) > 0 {
 		state := AsOrderingState(desired, observed, reqres)
 
 		edges, err := AsEdges(deps)
@@ -754,8 +809,25 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 			reqnames[name] = true
 		}
 
+		// Only what the pipeline declared is validated. Carried edges are
+		// valid by construction - both ends exist, and none closes a cycle -
+		// so history can never fail a reconcile.
 		if err := g.Validate(state, reqnames); err != nil {
-			return CompositionResult{}, errors.Wrap(err, errInvalidDependencies)
+			return CompositionResult{}, errors.Wrap(attributeToSteps(err, declaredBy), errInvalidDependencies)
+		}
+
+		if len(carried) > 0 {
+			ce, err := AsEdges(carried)
+			if err != nil {
+				return CompositionResult{}, errors.Wrap(err, errInvalidDependencies)
+			}
+
+			g = ordering.New(slices.Concat(g.Edges(), ce)...)
+
+			// Persist them too. A resource held back from deletion keeps its
+			// reference, and its reference must keep the edges, or an XR
+			// deleted mid-wave would tear down out of order.
+			deps = slices.Concat(deps, carried)
 		}
 
 		decisions = g.Decide(state)
@@ -1047,7 +1119,13 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 	// Record the resources this XR depends on so the controller can watch them.
 	// A resource it composes is matched by name; a resource it requires is
 	// matched by name or label.
-	composed := make([]dependency.Reference, 0, len(desired))
+	//
+	// With ordering, that includes what's left desired state but still exists.
+	// Its deletion finishing is the event that releases whatever the graph was
+	// holding back behind it, and with realtime compositions nothing else
+	// wakes the XR: without the watch, a live removal stalls after its first
+	// wave.
+	composed := make([]dependency.Reference, 0, len(desired)+len(observed))
 	for _, cd := range desired {
 		composed = append(composed, dependency.Reference{
 			GVK:       cd.Resource.GetObjectKind().GroupVersionKind(),
@@ -1055,6 +1133,21 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 			Name:      cd.Resource.GetName(),
 		})
 	}
+
+	if c.ordering {
+		for name, cd := range observed {
+			if _, ok := desired[name]; ok {
+				continue
+			}
+
+			composed = append(composed, dependency.Reference{
+				GVK:       cd.Resource.GetObjectKind().GroupVersionKind(),
+				Namespace: cd.Resource.GetNamespace(),
+				Name:      cd.Resource.GetName(),
+			})
+		}
+	}
+
 	c.tracker.Track(xrKey, composed, required)
 
 	return CompositionResult{
@@ -1064,7 +1157,7 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 		Events:            events,
 		Conditions:        conditions,
 		TTL:               ttl,
-		Pending:           pendingResources(decisions, desired, observed, deps),
+		Pending:           pendingResources(decisions, desired, observed, deps, xr.GetNamespace() != ""),
 	}, nil
 }
 
@@ -1079,7 +1172,7 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 // A resource held back from creation is the case that needs this most. It has
 // no composed resource reference - Crossplane doesn't write one for something
 // it deliberately hasn't applied - so this is the only place it appears.
-func pendingResources(decisions ordering.Decisions, desired, observed ComposedResourceStates, deps []*fnv1.Dependency) []reference.Pending {
+func pendingResources(decisions ordering.Decisions, desired, observed ComposedResourceStates, deps []*fnv1.Dependency, namespaced bool) []reference.Pending {
 	if len(decisions.Blocked) == 0 {
 		return nil
 	}
@@ -1091,14 +1184,14 @@ func pendingResources(decisions ordering.Decisions, desired, observed ComposedRe
 
 		switch {
 		case d.GetComposedResource() != "":
-			e.Name = d.GetComposedResource()
+			e.ResourceName = d.GetComposedResource()
 		case d.GetRequiredResource() != nil:
 			r := d.GetRequiredResource()
 			e.Type = reference.DependencyTypeRequiredResource
 			e.Requirement = &reference.RequirementDependency{
-				Name:         r.GetRequirementName(),
-				ResourceName: r.GetName(),
-				Namespace:    r.GetNamespace(),
+				RequirementName: r.GetRequirementName(),
+				Name:            r.GetName(),
+				Namespace:       r.GetNamespace(),
 			}
 		default:
 			continue
@@ -1144,7 +1237,14 @@ func pendingResources(decisions ordering.Decisions, desired, observed ComposedRe
 		gvk := cd.Resource.GetObjectKind().GroupVersionKind()
 		p.APIVersion = gvk.GroupVersion().String()
 		p.Kind = gvk.Kind
-		p.Namespace = cd.Resource.GetNamespace()
+
+		// A namespaced XR composes only into its own namespace, so there's
+		// nothing to record - and its schema has no namespace field. Setting
+		// one anyway would be pruned on write, so status would never match
+		// what we compute, and every reconcile would write it again.
+		if !namespaced {
+			p.Namespace = cd.Resource.GetNamespace()
+		}
 
 		pending = append(pending, p)
 	}

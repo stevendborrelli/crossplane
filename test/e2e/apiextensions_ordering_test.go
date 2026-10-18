@@ -206,14 +206,8 @@ func composedStateIs(want map[string]bool) features.Func {
 	return composedStateIsWithin(45*time.Second, want)
 }
 
-// composedStateIsWithin is composedStateIs with an explicit deadline.
-//
-// A graph more than a few levels deep trips the realtime compositions watch
-// circuit breaker - the XR reports "Too many watch events" - after which
-// events are only allowed periodically and each remaining wave takes about a
-// minute instead of seconds. That is documented behavior, not a hang, so
-// deeper graphs need a deadline well above the sum of their readyAfter values.
-// See notes-circuit-breaker-scale-findings.md.
+// composedStateIsWithin is composedStateIs with an explicit deadline, for a
+// graph deep enough that its waves take longer than the default allows.
 func composedStateIsWithin(d time.Duration, want map[string]bool) features.Func {
 	return composedStateOfIsWithin(modernSubject, d, want)
 }
@@ -314,6 +308,55 @@ func TestComposedResourceOrderingTeardownIsOrdered(t *testing.T) {
 				// run to completion.
 				funcs.ResourcesDeletedWithin(1*time.Minute, manifests, "xr.yaml"),
 			).
+			WithTeardown("DeletePrerequisites", funcs.AllOf(
+				funcs.DeleteResourcesWithPropagationPolicy(manifests, "setup/*.yaml", metav1.DeletePropagationForeground),
+				funcs.ResourcesDeletedWithin(3*time.Minute, manifests, "setup/*.yaml"),
+			)).
+			Feature(),
+	)
+}
+
+func TestComposedResourceOrderingRemovalIsOrdered(t *testing.T) {
+	manifests := "test/e2e/manifests/apiextensions/composition/ordering"
+	environment.Test(t,
+		features.NewWithDescription(t.Name(), "Tests that when a pipeline drops resources and their edges while the XR stays, Crossplane still deletes them in order, from the graph persisted on the XR. Each NopResource takes 5s to delete, which is what makes the order observable.").
+			WithLabel(LabelArea, LabelAreaAPIExtensions).
+			WithLabel(LabelSize, LabelSizeSmall).
+			WithLabel(config.LabelTestSuite, SuiteComposedResourceOrdering).
+			WithSetup("PrerequisitesAreCreated", funcs.AllOf(
+				funcs.ApplyResources(FieldManager, manifests, "setup/*.yaml"),
+				funcs.ResourcesCreatedWithin(30*time.Second, manifests, "setup/*.yaml"),
+				funcs.ResourcesHaveConditionWithin(1*time.Minute, manifests, "setup/definition.yaml", apiextensionsv1.WatchingComposite()),
+				funcs.ResourcesHaveConditionWithin(2*time.Minute, manifests, "setup/functions.yaml", pkgv1.Healthy(), pkgv1.Active()),
+				funcs.ResourcesHaveConditionWithin(3*time.Minute, manifests, "setup/provider.yaml", pkgv1.Healthy(), pkgv1.Active()),
+			)).
+			Assess("UseTheSlowDeletingComposition", funcs.AllOf(
+				funcs.ApplyResources(FieldManager, manifests, "teardown/composition.yaml"),
+				funcs.ResourcesCreatedWithin(30*time.Second, manifests, "teardown/composition.yaml"),
+			)).
+			Assess("CreateXR", funcs.AllOf(
+				funcs.ApplyResources(FieldManager, manifests, "xr.yaml"),
+				funcs.ResourcesCreatedWithin(30*time.Second, manifests, "xr.yaml"),
+			)).
+			Assess("XRIsReady",
+				funcs.ResourcesHaveConditionWithin(1*time.Minute, manifests, "xr.yaml", xpv2.Available()),
+			).
+			// The pipeline is about to stop declaring these edges, so the
+			// persisted graph is the only thing that can order the removal.
+			Assess("GraphIsPersistedOnTheXR", xrReferencesCarryGraph()).
+			Assess("DropSecondAndThirdAndTheirEdges", funcs.ApplyResources(FieldManager, manifests, "remove/composition.yaml")).
+			Assess("OnlyTheLeafIsDeleting",
+				composedStateIs(map[string]bool{"first": false, "second": false, "third": true}),
+			).
+			Assess("ThenSecondIsDeleting",
+				composedStateIs(map[string]bool{"first": false, "second": true}),
+			).
+			Assess("SecondIsGone", composedStateIs(exists("first"))).
+			Assess("FirstStays", composedStateStays(10*time.Second, exists("first"))).
+			WithTeardown("DeleteXR", funcs.AllOf(
+				funcs.DeleteResourcesWithPropagationPolicy(manifests, "xr.yaml", metav1.DeletePropagationBackground),
+				funcs.ResourcesDeletedWithin(2*time.Minute, manifests, "xr.yaml"),
+			)).
 			WithTeardown("DeletePrerequisites", funcs.AllOf(
 				funcs.DeleteResourcesWithPropagationPolicy(manifests, "setup/*.yaml", metav1.DeletePropagationForeground),
 				funcs.ResourcesDeletedWithin(3*time.Minute, manifests, "setup/*.yaml"),
@@ -1096,6 +1139,242 @@ func TestComposedResourceOrderingTeardownIsOrderedInNestedXR(t *testing.T) {
 			WithTeardown("DeleteParentXRD", funcs.AllOf(
 				funcs.DeleteResources(manifests, "nested/definition.yaml"),
 				funcs.ResourcesDeletedWithin(2*time.Minute, manifests, "nested/definition.yaml"),
+			)).
+			WithTeardown("DeletePrerequisites", funcs.AllOf(
+				funcs.DeleteResourcesWithPropagationPolicy(manifests, "setup/*.yaml", metav1.DeletePropagationForeground),
+				funcs.ResourcesDeletedWithin(3*time.Minute, manifests, "setup/*.yaml"),
+			)).
+			Feature(),
+	)
+}
+
+// composedStateStays asserts that the composed resources stay in the wanted
+// state for the whole of d. It's how a test shows ordering holding something
+// back, rather than catching it before it happened to move.
+func composedStateStays(d time.Duration, want map[string]bool) features.Func {
+	return func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		t.Helper()
+
+		deadline := time.Now().Add(d)
+		for time.Now().Before(deadline) {
+			if got := deletingByResourceNameOf(ctx, t, c, modernSubject); !maps.Equal(got, want) {
+				logXRReferences(ctx, t, c)
+				t.Fatalf("composed resources changed while ordering should have held them: want %v, got %v (true if deleting)", want, got)
+			}
+
+			time.Sleep(time.Second)
+		}
+
+		return ctx
+	}
+}
+
+// pendingResources returns the XR's status.crossplane.pendingResources.
+func pendingResources(ctx context.Context, t *testing.T, c *envconf.Config) []map[string]any {
+	t.Helper()
+
+	xr := &unstructured.Unstructured{}
+	if err := modernSubject.get(ctx, c, xr); err != nil {
+		t.Fatalf("cannot get XR: %v", err)
+	}
+
+	raw, _, _ := unstructured.NestedSlice(xr.Object, "status", "crossplane", "pendingResources")
+	out := make([]map[string]any, 0, len(raw))
+
+	for _, r := range raw {
+		if m, ok := r.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+
+	return out
+}
+
+// pendingIs waits for the XR's pending resources to satisfy check, which
+// returns why they don't.
+func pendingIs(d time.Duration, check func(pending []map[string]any) string) features.Func {
+	return func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		t.Helper()
+
+		var why string
+
+		err := wait.For(func(context.Context) (bool, error) {
+			why = check(pendingResources(ctx, t, c))
+			return why == "", nil
+		}, wait.WithTimeout(d), wait.WithInterval(time.Second))
+		if err != nil {
+			t.Logf("pending: %v", pendingResources(ctx, t, c))
+			t.Fatalf("status.crossplane.pendingResources: %s", why)
+		}
+
+		return ctx
+	}
+}
+
+// pendingEntry returns the pending entry for a composed resource, if any.
+func pendingEntry(pending []map[string]any, name string) map[string]any {
+	for _, p := range pending {
+		if p["resourceName"] == name {
+			return p
+		}
+	}
+
+	return nil
+}
+
+// xrIsNotReady asserts the XR's Ready condition isn't True.
+func xrIsNotReady() features.Func {
+	return func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		t.Helper()
+
+		xr := &unstructured.Unstructured{}
+		if err := modernSubject.get(ctx, c, xr); err != nil {
+			t.Fatalf("cannot get XR: %v", err)
+		}
+
+		conds, _, _ := unstructured.NestedSlice(xr.Object, "status", "conditions")
+		for _, cond := range conds {
+			m, ok := cond.(map[string]any)
+			if ok && m["type"] == "Ready" && m["status"] == "True" {
+				t.Fatalf("the XR is Ready, but a deadlocked composed resource means it can never converge: %v", m)
+			}
+		}
+
+		return ctx
+	}
+}
+
+func TestComposedResourceOrderingWaitsForRequiredResource(t *testing.T) {
+	manifests := "test/e2e/manifests/apiextensions/composition/ordering"
+	environment.Test(t,
+		features.NewWithDescription(t.Name(), "Tests that a composed resource that depends on a required resource isn't created until the requirement is satisfied, that its dependents wait with it, and that the XR reports what it's waiting for.").
+			WithLabel(LabelArea, LabelAreaAPIExtensions).
+			WithLabel(LabelSize, LabelSizeSmall).
+			WithLabel(config.LabelTestSuite, SuiteComposedResourceOrdering).
+			WithSetup("PrerequisitesAreCreated", funcs.AllOf(
+				funcs.ApplyResources(FieldManager, manifests, "setup/*.yaml"),
+				funcs.ResourcesCreatedWithin(30*time.Second, manifests, "setup/*.yaml"),
+				funcs.ResourcesHaveConditionWithin(1*time.Minute, manifests, "setup/definition.yaml", apiextensionsv1.WatchingComposite()),
+				funcs.ResourcesHaveConditionWithin(2*time.Minute, manifests, "setup/functions.yaml", pkgv1.Healthy(), pkgv1.Active()),
+			)).
+			Assess("UseTheRequiringComposition", funcs.AllOf(
+				funcs.ApplyResources(FieldManager, manifests, "required/composition.yaml"),
+				funcs.ResourcesCreatedWithin(30*time.Second, manifests, "required/composition.yaml"),
+			)).
+			Assess("CreateXR", funcs.AllOf(
+				funcs.ApplyResources(FieldManager, manifests, "xr.yaml"),
+				funcs.ResourcesCreatedWithin(30*time.Second, manifests, "xr.yaml"),
+			)).
+			Assess("AppReportsTheRequirement", pendingIs(1*time.Minute, func(pending []map[string]any) string {
+				app := pendingEntry(pending, "app")
+				if app == nil || app["operation"] != "Create" {
+					return "want app pending creation"
+				}
+
+				deps, _ := app["dependsOn"].([]any)
+				for _, d := range deps {
+					dep, _ := d.(map[string]any)
+					req, _ := dep["requirement"].(map[string]any)
+					if dep["type"] == "RequiredResource" && req["requirementName"] == "env" {
+						return ""
+					}
+				}
+
+				return "want app's dependsOn to name the env requirement"
+			})).
+			Assess("SidecarWaitsOnApp", pendingIs(30*time.Second, func(pending []map[string]any) string {
+				if s := pendingEntry(pending, "sidecar"); s == nil || s["operation"] != "Create" {
+					return "want sidecar pending creation"
+				}
+
+				return ""
+			})).
+			Assess("NothingIsCreatedWithoutTheRequirement", composedStateStays(15*time.Second, map[string]bool{})).
+			Assess("CreateTheRequiredResource", funcs.AllOf(
+				funcs.ApplyResources(FieldManager, manifests, "environmentconfig.yaml"),
+				funcs.ResourcesCreatedWithin(30*time.Second, manifests, "environmentconfig.yaml"),
+			)).
+			Assess("ThenBothAreCreated", composedStateIsWithin(2*time.Minute, exists("app", "sidecar"))).
+			Assess("XRIsReady",
+				funcs.ResourcesHaveConditionWithin(1*time.Minute, manifests, "xr.yaml", xpv2.Available()),
+			).
+			Assess("NothingIsPending", pendingIs(30*time.Second, func(pending []map[string]any) string {
+				if len(pending) > 0 {
+					return "want nothing pending once the requirement is satisfied"
+				}
+
+				return ""
+			})).
+			WithTeardown("DeleteXR", funcs.AllOf(
+				funcs.DeleteResourcesWithPropagationPolicy(manifests, "xr.yaml", metav1.DeletePropagationBackground),
+				funcs.ResourcesDeletedWithin(2*time.Minute, manifests, "xr.yaml"),
+			)).
+			WithTeardown("DeleteTheRequiredResourceAndComposition", funcs.AllOf(
+				funcs.DeleteResources(manifests, "environmentconfig.yaml"),
+				funcs.DeleteResources(manifests, "required/composition.yaml"),
+				funcs.ResourcesDeletedWithin(1*time.Minute, manifests, "environmentconfig.yaml"),
+				funcs.ResourcesDeletedWithin(1*time.Minute, manifests, "required/composition.yaml"),
+			)).
+			WithTeardown("DeletePrerequisites", funcs.AllOf(
+				funcs.DeleteResourcesWithPropagationPolicy(manifests, "setup/*.yaml", metav1.DeletePropagationForeground),
+				funcs.ResourcesDeletedWithin(3*time.Minute, manifests, "setup/*.yaml"),
+			)).
+			Feature(),
+	)
+}
+
+func TestComposedResourceOrderingReportsContradiction(t *testing.T) {
+	manifests := "test/e2e/manifests/apiextensions/composition/ordering"
+	environment.Test(t,
+		features.NewWithDescription(t.Name(), "Tests that when the pipeline drops a resource another still-desired resource depends on, Crossplane neither deletes it nor waits silently: it reports the resource as deadlocked and holds the XR un-ready, and recovers once the contradiction is resolved.").
+			WithLabel(LabelArea, LabelAreaAPIExtensions).
+			WithLabel(LabelSize, LabelSizeSmall).
+			WithLabel(config.LabelTestSuite, SuiteComposedResourceOrdering).
+			WithSetup("PrerequisitesAreCreated", funcs.AllOf(
+				funcs.ApplyResources(FieldManager, manifests, "setup/*.yaml"),
+				funcs.ResourcesCreatedWithin(30*time.Second, manifests, "setup/*.yaml"),
+				funcs.ResourcesHaveConditionWithin(1*time.Minute, manifests, "setup/definition.yaml", apiextensionsv1.WatchingComposite()),
+				funcs.ResourcesHaveConditionWithin(2*time.Minute, manifests, "setup/functions.yaml", pkgv1.Healthy(), pkgv1.Active()),
+			)).
+			Assess("ComposeTheVPCAndSubnet", funcs.AllOf(
+				funcs.ApplyResources(FieldManager, manifests, "contradiction/composition-before.yaml"),
+				funcs.ResourcesCreatedWithin(30*time.Second, manifests, "contradiction/composition-before.yaml"),
+				funcs.ApplyResources(FieldManager, manifests, "xr.yaml"),
+				funcs.ResourcesCreatedWithin(30*time.Second, manifests, "xr.yaml"),
+			)).
+			Assess("XRIsReady",
+				funcs.ResourcesHaveConditionWithin(1*time.Minute, manifests, "xr.yaml", xpv2.Available()),
+			).
+			Assess("BothExist", composedStateIs(exists("vpc", "subnet"))).
+			Assess("DropTheVPCButKeepTheSubnet", funcs.ApplyResources(FieldManager, manifests, "contradiction/composition.yaml")).
+			Assess("TheVPCIsReportedDeadlocked", pendingIs(1*time.Minute, func(pending []map[string]any) string {
+				vpc := pendingEntry(pending, "vpc")
+				if vpc == nil || vpc["operation"] != "Delete" || vpc["deadlocked"] != true {
+					return "want vpc pending deletion and deadlocked"
+				}
+
+				return ""
+			})).
+			Assess("TheVPCIsNotDeleted", composedStateStays(15*time.Second, exists("vpc", "subnet"))).
+			Assess("TheXRIsNotReady", xrIsNotReady()).
+			Assess("ResolveTheContradiction", funcs.ApplyResources(FieldManager, manifests, "contradiction/composition-before.yaml")).
+			Assess("NothingIsPending", pendingIs(1*time.Minute, func(pending []map[string]any) string {
+				if len(pending) > 0 {
+					return "want nothing pending once the pipeline wants the vpc again"
+				}
+
+				return ""
+			})).
+			Assess("XRIsReadyAgain",
+				funcs.ResourcesHaveConditionWithin(1*time.Minute, manifests, "xr.yaml", xpv2.Available()),
+			).
+			WithTeardown("DeleteXR", funcs.AllOf(
+				funcs.DeleteResourcesWithPropagationPolicy(manifests, "xr.yaml", metav1.DeletePropagationBackground),
+				funcs.ResourcesDeletedWithin(2*time.Minute, manifests, "xr.yaml"),
+			)).
+			WithTeardown("DeleteComposition", funcs.AllOf(
+				funcs.DeleteResources(manifests, "contradiction/composition-before.yaml"),
+				funcs.ResourcesDeletedWithin(1*time.Minute, manifests, "contradiction/composition-before.yaml"),
 			)).
 			WithTeardown("DeletePrerequisites", funcs.AllOf(
 				funcs.DeleteResourcesWithPropagationPolicy(manifests, "setup/*.yaml", metav1.DeletePropagationForeground),

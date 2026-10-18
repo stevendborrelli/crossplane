@@ -17,6 +17,7 @@ limitations under the License.
 package ordering
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -119,6 +120,46 @@ func TestValidate(t *testing.T) {
 				t.Errorf("\n%s\nValidate(...): unexpected error: %v", tc.reason, err)
 			}
 		})
+	}
+}
+
+// TestValidateCyclePathIsNotGarbled pins the reported cycle path against the
+// append-aliasing that made it wrong.
+//
+// The cycle detector builds the path it reports by appending each visited
+// node onto its parent's path. Appending in place lets one sibling branch
+// overwrite the backing array another branch's recursion is still reading,
+// so the "dependency cycle: [...]" message could name nodes that were never
+// on the cycle it found. The shape that triggers it: a node with several
+// dependents, where the cycle is behind one of them.
+func TestValidateCyclePathIsNotGarbled(t *testing.T) {
+	// d hangs off b, and the cycle runs b -> c -> b. Visiting d first (nodes
+	// are sorted, so d precedes nothing here - b is visited first with d's
+	// path still spare) must not leave d in the path the b-c cycle reports.
+	g := New(
+		on("d", "b"),
+		on("b", "c"),
+		on("c", "b"),
+	)
+
+	s := State{Composed: map[string]ComposedState{
+		"b": live,
+		"c": live,
+		"d": live,
+	}}
+
+	err := g.Validate(s, nil)
+	if err == nil {
+		t.Fatal("Validate(...): want a cycle error, got none")
+	}
+
+	// The reported path must start and end at the cycle, and must not contain
+	// d: it is a dependent of the cycle, not part of it. The exact message is
+	// "dependency cycle: [b c b]" - the visit order is deterministic because
+	// dependenciesOf is sorted.
+	want := "dependency cycle: [b c b]"
+	if err.Error() != want {
+		t.Errorf("Validate(...):\nwant: %s\n got: %s", want, err)
 	}
 }
 
@@ -283,4 +324,47 @@ func TestTargetDescribe(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestValidateErrorsCarryTheirEdges pins that validation failures say which
+// edges caused them, so the composer can name the pipeline step that declared
+// them.
+func TestValidateErrorsCarryTheirEdges(t *testing.T) {
+	live := ComposedState{Desired: true, Observed: true}
+	s := State{Composed: map[string]ComposedState{"a": live, "b": live, "c": live, "d": live}}
+
+	t.Run("EdgeError", func(t *testing.T) {
+		bad := onReq("a", "undeclared")
+		err := New(on("b", "a"), bad).Validate(s, map[string]bool{})
+
+		ee := &EdgeError{}
+		if !errors.As(err, &ee) {
+			t.Fatalf("Validate(...): want an *EdgeError, got %T: %v", err, err)
+		}
+
+		if diff := cmp.Diff(bad, ee.Edge); diff != "" {
+			t.Errorf("EdgeError.Edge: -want, +got:\n%s", diff)
+		}
+	})
+
+	t.Run("CycleError", func(t *testing.T) {
+		// d leads into the cycle but isn't part of it.
+		err := New(on("d", "a"), on("a", "b"), on("b", "c"), on("c", "a")).Validate(s, nil)
+
+		ce := &CycleError{}
+		if !errors.As(err, &ce) {
+			t.Fatalf("Validate(...): want a *CycleError, got %T: %v", err, err)
+		}
+
+		got := ce.Edges()
+		for _, e := range got {
+			if e.Resource == "d" {
+				t.Errorf("CycleError.Edges(): %v includes an edge leading into the cycle, not on it", got)
+			}
+		}
+
+		if len(got) != 3 {
+			t.Errorf("CycleError.Edges(): want the 3 edges of the cycle, got %v", got)
+		}
+	})
 }

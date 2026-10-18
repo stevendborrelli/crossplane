@@ -53,11 +53,17 @@ func dep(resource, dependsOn string) *fnv1.Dependency {
 }
 
 // state returns a composed resource state for a resource of the supplied kind.
+// The resource carries this XR's controller reference, which teardown requires
+// before it will consider deleting it.
 func state(kind, name string) ComposedResourceState {
 	cd := composed.New()
 	cd.SetAPIVersion("example.org/v1")
 	cd.SetKind(kind)
 	cd.SetName(name)
+	cd.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: "example.org/v1", Kind: "XR", Name: "cool-xr", UID: teardownXRUID,
+		Controller: new(true), BlockOwnerDeletion: new(true),
+	}})
 
 	return ComposedResourceState{Resource: cd}
 }
@@ -345,10 +351,10 @@ func TestPendingResources(t *testing.T) {
 				Operation:    reference.OperationCreate,
 				Reason:       "waiting for vpc to be ready",
 				DependsOn: []reference.Dependency{
-					{Name: "vpc"},
+					{ResourceName: "vpc"},
 					{
 						Type:        reference.DependencyTypeRequiredResource,
-						Requirement: &reference.RequirementDependency{Name: "kubeconfig"},
+						Requirement: &reference.RequirementDependency{RequirementName: "kubeconfig"},
 					},
 				},
 			}},
@@ -383,10 +389,10 @@ func TestPendingResources(t *testing.T) {
 				Reason:       "depends on vpc, which is not desired",
 				Deadlocked:   true,
 				DependsOn: []reference.Dependency{
-					{Name: "vpc"},
+					{ResourceName: "vpc"},
 					{
 						Type:        reference.DependencyTypeRequiredResource,
-						Requirement: &reference.RequirementDependency{Name: "kubeconfig"},
+						Requirement: &reference.RequirementDependency{RequirementName: "kubeconfig"},
 					},
 				},
 			}},
@@ -395,7 +401,7 @@ func TestPendingResources(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got := pendingResources(tc.decisions, tc.desired, tc.observed, deps)
+			got := pendingResources(tc.decisions, tc.desired, tc.observed, deps, false)
 
 			if diff := cmp.Diff(tc.want, got, cmpopts.EquateEmpty()); diff != "" {
 				t.Errorf("\n%s\npendingResources(...): -want, +got:\n%s", tc.reason, diff)
@@ -464,6 +470,8 @@ func TestOrderingOnLegacyXRs(t *testing.T) {
 func TestTeardownOrdersALegacyXR(t *testing.T) {
 	xr := composite.New(composite.WithSchema(composite.SchemaLegacy))
 	xr.SetName("cool-xr")
+	// The observed resources carry this XR's controller reference via state().
+	xr.SetUID(teardownXRUID)
 	xr.SetComposedResourceReferences([]reference.Composed{
 		{APIVersion: "example.org/v1", Kind: "Thing", Name: "cool-xr-vpc", ResourceName: "vpc"},
 		{APIVersion: "example.org/v1", Kind: "Thing", Name: "cool-xr-subnet", ResourceName: "subnet", DependsOn: []string{"vpc"}},
@@ -500,5 +508,43 @@ func TestTeardownOrdersALegacyXR(t *testing.T) {
 
 	if diff := cmp.Diff([]string{"subnet"}, deleted); diff != "" {
 		t.Errorf("teardown(...) deletes the leaf first on a legacy XR too: -want, +got:\n%s", diff)
+	}
+}
+
+// TestPendingResourcesNamespace pins that a pending entry records a namespace
+// only for a cluster scoped XR. A namespaced XR's schema has no namespace
+// field, so setting one would be pruned on write and status would never match
+// what the composer computes - turning every reconcile into a status write.
+func TestPendingResourcesNamespace(t *testing.T) {
+	vpc := composed.New()
+	vpc.SetAPIVersion("example.org/v1")
+	vpc.SetKind("Thing")
+	vpc.SetName("cool-xr-vpc")
+	vpc.SetNamespace("cool-ns")
+
+	decisions := ordering.Decisions{Blocked: map[string]ordering.Decision{
+		"vpc": {Blocked: true, Reason: "subnet still depends on it"},
+	}}
+	observed := ComposedResourceStates{"vpc": {Resource: vpc}}
+
+	cases := map[string]struct {
+		namespaced bool
+		want       string
+	}{
+		"ClusterScopedXR": {namespaced: false, want: "cool-ns"},
+		"NamespacedXR":    {namespaced: true, want: ""},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := pendingResources(decisions, ComposedResourceStates{}, observed, nil, tc.namespaced)
+			if len(got) != 1 {
+				t.Fatalf("pendingResources(...): want one entry, got %+v", got)
+			}
+
+			if got[0].Namespace != tc.want {
+				t.Errorf("pendingResources(...)[0].Namespace: want %q, got %q", tc.want, got[0].Namespace)
+			}
+		})
 	}
 }

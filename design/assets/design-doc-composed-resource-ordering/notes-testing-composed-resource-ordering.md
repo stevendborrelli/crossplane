@@ -428,20 +428,20 @@ it.
 | --- | --- |
 | `CreatesInWaves` | Only the roots exist before the level below them is ready, over a four-level graph with a diamond, fan-out and parallel branches. Unordered composition creates all ten at once. |
 | `TeardownIsOrdered` | Only the leaf carries a deletion timestamp while what it depends on is untouched. A cascade stamps all three at once. |
+| `RemovalIsOrdered` | With the XR still live, the pipeline drops two resources and the edges between them. They still go a level at a time, leaf first, which only the graph persisted on the XR can order: nothing the pipeline declares does. Needs a function build with `dropRemovedEdges`. |
 | `TeardownBlocks` | A resource that refuses to delete holds the XR indefinitely and says so; clearing the cause lets teardown resume where it stopped. |
 | `CreateBeforeDestroy` | A replacement and its predecessor exist at the same time, which a symmetric edge would never allow. |
 | `TeardownSurvivesRestart` | Teardown continues in order after Crossplane is restarted mid-way. The replacement process never ran the pipeline for that XR, so the order can only have come from `spec.crossplane.resourceRefs`. |
 | `TeardownIsOrderedOnLegacyXR` | A legacy v1 XR tears down a level at a time too, reading the graph from `spec.resourceRefs`. If teardown ever read only the modern path, it would find no graph and cascade, which looks exactly like finishing. |
 | `TeardownIsOrderedInNestedXR` | An XR composed by another XR tears down in its own order when the parent deletes it. Crossplane deletes composed resources with background propagation when ordering is on; a foreground delete would have the garbage collector delete all of the child's resources at once. |
+| `WaitsForRequiredResource` | A composed resource that depends on a required resource isn't created until the requirement is satisfied, its dependents wait with it, and `pendingResources` names the requirement. |
+| `ReportsContradiction` | When the pipeline drops a resource another still-desired resource depends on, it isn't deleted: it's reported deadlocked, the XR is held un-ready, and both recover once the pipeline wants it again. |
 
-Required resources and graph contradictions have fixtures but no end-to-end
-test; both are covered by unit tests.
-
-The whole suite took about seven minutes on an 8 vCPU machine, including
-building Crossplane, before the circuit breaker exemption. `CreatesInWaves` was
-most of it: the suite leaves the breaker at its defaults, so it opened partway
-through the four-level graph and later waves waited for its periodic probe. The
-exemption should remove that wait; the suite hasn't been timed since.
+The nine tests before `RemovalIsOrdered` took about seven minutes on an 8 vCPU
+machine, not counting building Crossplane, with the circuit breaker at its
+defaults. `CreatesInWaves` is the longest, at just under two minutes.
+`RemovalIsOrdered` hasn't been timed yet; its waves are the same as
+`TeardownIsOrdered`'s.
 
 ## Rebuilding the function
 
